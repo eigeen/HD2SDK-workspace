@@ -113,6 +113,15 @@ class RemapPlan:
     extra_unit_file_ids: List[int]
 
 
+@dataclass(frozen=True)
+class EntryRewriteContext:
+    remap: Dict[int, int]
+    slot_remap: Dict[int, int]
+    unit_targets: Dict[int, Tuple[int, ...]]
+    source_units: Dict[int, Any]
+    target_units: Dict[int, Any]
+
+
 def build_remap(
     source: StreamToc, target: StreamToc, log_prefix: str = ""
 ) -> RemapPlan:
@@ -202,6 +211,7 @@ def migrate_one(
         counts: Dict[int, Tuple[int, int]] = {}
         skipped_file_ids: set[int] = set()
         extra_unit_file_ids = [int(x) for x in precomputed.get("extra_unit_file_ids", [])]
+        unit_targets: Dict[int, Tuple[int, ...]] = {}
     else:
         assert source is not None and target is not None
         plan = build_remap(source, target, log_prefix=f"[{target_entry.name}]")
@@ -211,6 +221,7 @@ def migrate_one(
         skipped_file_ids = plan.skipped_file_ids
         extra_unit_file_ids = plan.extra_unit_file_ids
         slot_remap = {}
+        unit_targets = {}
         write_file_ids: Optional[set[int]] = None
         if reference_remap is not None:
             ref_file_ids = {int(k): int(v) for k, v in reference_remap.get("file_ids", {}).items()}
@@ -241,9 +252,9 @@ def migrate_one(
                 _log_experimental_unit_remap(target_entry, unit_remap)
                 skipped_file_ids.update(_unit_issue_file_ids(unit_remap))
             remap.update(unit_remap.remap)
-            _add_unit_header_ref_remaps(remap, unit_remap, source, target, target_entry)
             if unit_remap.extra_unit_file_ids:
                 extra_unit_file_ids = unit_remap.extra_unit_file_ids
+            unit_targets = unit_remap.expanded_remap
             skipped_file_ids.difference_update(unit_remap.remap.keys())
             _log_unit_geometry_remap(target_entry, unit_remap)
             if write_file_ids is not None:
@@ -262,6 +273,7 @@ def migrate_one(
                     _format_unsafe_type_counts(unsafe_types, plan),
                 )
 
+    rewrite_context = _entry_rewrite_context(remap, slot_remap, unit_targets, (source, target))
     new_patch = StreamToc()
     written = 0
     for e in patch.entries:
@@ -274,18 +286,22 @@ def migrate_one(
                         target_entry.name, e.file_id, TYPE_NAMES.get(e.type_id, hex(e.type_id)))
             continue
 
-        new_file_id = remap.get(e.file_id, e.file_id)
-
-        # Copy entry, rewriting any embedded references.
-        new_entry = type(e)(
-            file_id=new_file_id,
-            type_id=e.type_id,
-            toc_data=refs.rewrite(e.type_id, e.toc_data, remap, slot_remap=slot_remap),
-            gpu_data=e.gpu_data,
-            stream_data=e.stream_data,
-        )
-        new_patch.entries.append(new_entry)
-        written += 1
+        for new_file_id in _entry_target_file_ids(e, rewrite_context):
+            entry_remap = _entry_specific_remap(e, new_file_id, rewrite_context)
+            new_entry = type(e)(
+                file_id=new_file_id,
+                type_id=e.type_id,
+                toc_data=refs.rewrite(
+                    e.type_id,
+                    e.toc_data,
+                    entry_remap,
+                    slot_remap=slot_remap,
+                ),
+                gpu_data=e.gpu_data,
+                stream_data=e.stream_data,
+            )
+            new_patch.entries.append(new_entry)
+            written += 1
 
     # Apply padding for extra target unit slots not covered by the source mod.
     padded_extras: List[int] = []
@@ -509,6 +525,54 @@ def _entries_by_file_id(toc: StreamToc, type_id: int) -> Dict[int, Any]:
     return {entry.file_id: entry for entry in toc.by_type().get(type_id, [])}
 
 
+def _entry_rewrite_context(
+    remap: Dict[int, int],
+    slot_remap: Dict[int, int],
+    unit_targets: Dict[int, Tuple[int, ...]],
+    archives: Tuple[Optional[StreamToc], Optional[StreamToc]],
+) -> EntryRewriteContext:
+    """Prepare immutable lookup state for writing migrated patch entries."""
+    source, target = archives
+    source_units = _entries_by_file_id(source, UnitID) if source is not None else {}
+    target_units = _entries_by_file_id(target, UnitID) if target is not None else {}
+    return EntryRewriteContext(remap, slot_remap, unit_targets, source_units, target_units)
+
+
+def _entry_target_file_ids(entry: Any, context: EntryRewriteContext) -> Tuple[int, ...]:
+    """Return one or more output FileIDs for a patch entry."""
+    if entry.type_id == UnitID and entry.file_id in context.unit_targets:
+        return context.unit_targets[entry.file_id]
+    return (context.remap.get(entry.file_id, entry.file_id),)
+
+
+def _entry_specific_remap(
+    entry: Any,
+    target_file_id: int,
+    context: EntryRewriteContext,
+) -> Dict[int, int]:
+    """Return remap table with Unit header refs specialized for one target Unit."""
+    if entry.type_id != UnitID or entry.file_id == target_file_id:
+        return context.remap
+    if entry.file_id not in context.source_units or target_file_id not in context.target_units:
+        return context.remap
+    remap = dict(context.remap)
+    source_refs = _unit_header_refs(context.source_units[entry.file_id].toc_data)
+    target_refs = _unit_header_refs(context.target_units[target_file_id].toc_data)
+    _add_header_pair_remaps_silent(remap, source_refs, target_refs)
+    return remap
+
+
+def _add_header_pair_remaps_silent(
+    remap: Dict[int, int],
+    source_refs: Tuple[int, ...],
+    target_refs: Tuple[int, ...],
+) -> None:
+    for source_ref, target_ref in zip(source_refs, target_refs):
+        if source_ref == 0 or target_ref == 0:
+            continue
+        remap[source_ref] = target_ref
+
+
 def _find_unsafe_partial_types(
     patch: StreamToc,
     source: StreamToc,
@@ -693,15 +757,16 @@ def _log_unit_geometry_remap(
     """Log geometry Unit remap scores and top candidates."""
     log.info("[%s] applied geometry Unit remap: %d FileIDs",
              target_entry.name, len(unit_remap.remap))
-    for source_id, target_id in sorted(unit_remap.remap.items()):
+    for source_id, target_ids in sorted(unit_remap.expanded_remap.items()):
         score = unit_remap.scores.get(source_id, 0.0)
         margin = unit_remap.margins.get(source_id, 0.0)
         ranking = unit_remap.rankings.get(source_id, ())
         log.info(
-            "[%s]   Unit %d -> %d score=%.4f margin=%.4f candidates=%s",
+            "[%s]   Unit %d -> %s level=%s score=%.4f margin=%.4f candidates=%s",
             target_entry.name,
             source_id,
-            target_id,
+            list(target_ids),
+            unit_remap.match_levels.get(source_id, "geometry"),
             score,
             margin,
             list(ranking),

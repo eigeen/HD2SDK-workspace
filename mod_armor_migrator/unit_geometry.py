@@ -4,10 +4,17 @@ from __future__ import annotations
 import math
 import struct
 from dataclasses import dataclass, field
+from functools import lru_cache
 from typing import Dict, Iterable, List, Optional, Tuple
 
 from .archive import StreamToc, TocEntry
 from .constants import UnitID
+from .unit_body_shape import (
+    BodyPairPreassignmentRequest,
+    apply_body_variant_pair_preassignment,
+    apply_body_variant_pair_tiebreak,
+)
+from .unit_names import UnitCustomizationName, extract_unit_customization_name, unit_body_variant
 
 
 Point3 = Tuple[float, float, float]
@@ -45,6 +52,7 @@ class UnitGeometryIssue:
 @dataclass
 class UnitGeometryRemap:
     remap: Dict[int, int] = field(default_factory=dict)
+    expanded_remap: Dict[int, Tuple[int, ...]] = field(default_factory=dict)
     match_levels: Dict[int, str] = field(default_factory=dict)
     scores: Dict[int, float] = field(default_factory=dict)
     margins: Dict[int, float] = field(default_factory=dict)
@@ -53,6 +61,7 @@ class UnitGeometryRemap:
     ambiguous: List[UnitGeometryIssue] = field(default_factory=list)
     extra_unit_file_ids: List[int] = field(default_factory=list)
     claimed_target_file_ids: set[int] = field(default_factory=set)
+    empty_source_file_ids: set[int] = field(default_factory=set)
 
     def is_complete(self) -> bool:
         """Return True when every patch-used source Unit has one geometry match."""
@@ -82,6 +91,17 @@ class MeshLayout:
     sections: Tuple[MeshSection, ...]
 
 
+@dataclass(frozen=True)
+class UnitMatchContext:
+    patch_unit_ids: set[int]
+    source_signatures: Dict[int, UnitGeometrySignature]
+    target_signatures: Dict[int, UnitGeometrySignature]
+    source_names: Dict[int, Optional[UnitCustomizationName]]
+    target_names: Dict[int, Optional[UnitCustomizationName]]
+    source_variants: Dict[int, str]
+    target_variants: Dict[int, str]
+
+
 def build_unit_geometry_remap(
     patch: StreamToc,
     source: StreamToc,
@@ -90,12 +110,20 @@ def build_unit_geometry_remap(
 ) -> UnitGeometryRemap:
     """Build Unit FileID remaps by comparing parsed vertex distributions."""
     active_settings = settings or GeometryMatchSettings()
-    patch_unit_ids = _patch_source_unit_ids(patch, source)
-    source_signatures = build_archive_signatures(source, active_settings)
-    target_signatures = build_archive_signatures(target, active_settings)
+    context = _build_match_context(patch, source, target, active_settings)
     result = UnitGeometryRemap()
-    _record_missing_patch_units(result, patch_unit_ids, source_signatures, target_signatures)
-    _assign_geometry_matches(result, source_signatures, target_signatures, patch_unit_ids, active_settings)
+    result.empty_source_file_ids = _empty_patch_source_unit_ids(patch, context.patch_unit_ids, active_settings)
+    active_patch_unit_ids = context.patch_unit_ids - result.empty_source_file_ids
+    _record_missing_patch_units(result, context, active_patch_unit_ids)
+    _assign_geometry_matches(result, context, active_patch_unit_ids, active_settings)
+    apply_body_variant_pair_tiebreak(
+        result,
+        context.source_signatures,
+        context.target_signatures,
+        context.source_names,
+        context.target_variants,
+        active_patch_unit_ids,
+    )
     result.extra_unit_file_ids = _unmatched_target_ids(target, result)
     return result
 
@@ -107,6 +135,22 @@ def build_archive_signatures(
     """Return parseable Unit geometry signatures indexed by FileID."""
     signatures: Dict[int, UnitGeometrySignature] = {}
     for entry in toc.by_type().get(UnitID, []):
+        signature = build_unit_signature(entry, settings)
+        if signature is not None:
+            signatures[entry.file_id] = signature
+    return signatures
+
+
+def build_patch_unit_signatures(
+    patch: StreamToc,
+    source_unit_ids: set[int],
+    settings: GeometryMatchSettings,
+) -> Dict[int, UnitGeometrySignature]:
+    """Return parseable mod Unit geometry signatures from the input patch."""
+    signatures: Dict[int, UnitGeometrySignature] = {}
+    for entry in patch.by_type().get(UnitID, []):
+        if entry.file_id not in source_unit_ids:
+            continue
         signature = build_unit_signature(entry, settings)
         if signature is not None:
             signatures[entry.file_id] = signature
@@ -185,17 +229,92 @@ def _patch_source_unit_ids(patch: StreamToc, source: StreamToc) -> set[int]:
     }
 
 
+def _build_match_context(
+    patch: StreamToc,
+    source: StreamToc,
+    target: StreamToc,
+    settings: GeometryMatchSettings,
+) -> UnitMatchContext:
+    """Collect geometry signatures and BodyType variants for one remap."""
+    patch_unit_ids = _patch_source_unit_ids(patch, source)
+    return UnitMatchContext(
+        patch_unit_ids=patch_unit_ids,
+        source_signatures=build_patch_unit_signatures(patch, patch_unit_ids, settings),
+        target_signatures=build_archive_signatures(target, settings),
+        source_names=_source_customization_names(patch, source),
+        target_names=_archive_customization_names(target),
+        source_variants=_source_body_variants(patch, source),
+        target_variants=_archive_body_variants(target),
+    )
+
+
+def _archive_body_variants(toc: StreamToc) -> Dict[int, str]:
+    """Return Unit FileID to Any/Stocky/Slim variant from customization names."""
+    return {
+        entry.file_id: unit_body_variant(entry.toc_data)
+        for entry in toc.by_type().get(UnitID, [])
+    }
+
+
+def _source_body_variants(patch: StreamToc, source: StreamToc) -> Dict[int, str]:
+    """Return source Unit variants, preferring patch customization names."""
+    return {
+        source_id: name.body_variant() if name is not None else "Unknown"
+        for source_id, name in _source_customization_names(patch, source).items()
+    }
+
+
+def _source_customization_names(
+    patch: StreamToc,
+    source: StreamToc,
+) -> Dict[int, Optional[UnitCustomizationName]]:
+    """Return source Unit names, preferring patch customization names."""
+    names = _archive_customization_names(source)
+    for entry in patch.by_type().get(UnitID, []):
+        name = extract_unit_customization_name(entry.toc_data)
+        if entry.file_id in names and name is not None:
+            names[entry.file_id] = name
+    return names
+
+
+def _archive_customization_names(toc: StreamToc) -> Dict[int, Optional[UnitCustomizationName]]:
+    """Return Unit FileID to parsed customization name."""
+    return {
+        entry.file_id: extract_unit_customization_name(entry.toc_data)
+        for entry in toc.by_type().get(UnitID, [])
+    }
+
+
+def _empty_patch_source_unit_ids(
+    patch: StreamToc,
+    patch_unit_ids: set[int],
+    settings: GeometryMatchSettings,
+) -> set[int]:
+    """Detect invisible placeholder patch Units so their geometry is ignored."""
+    empty_ids: set[int] = set()
+    for entry in patch.by_type().get(UnitID, []):
+        if entry.file_id not in patch_unit_ids:
+            continue
+        signature = build_unit_signature(entry, settings)
+        if signature is not None and _is_empty_signature(signature):
+            empty_ids.add(entry.file_id)
+    return empty_ids
+
+
+def _is_empty_signature(signature: UnitGeometrySignature) -> bool:
+    return signature.vertex_count <= 2 or signature.diagonal < 0.0001
+
+
 def _record_missing_patch_units(
     result: UnitGeometryRemap,
-    patch_unit_ids: set[int],
-    source_signatures: Dict[int, UnitGeometrySignature],
-    target_signatures: Dict[int, UnitGeometrySignature],
+    context: UnitMatchContext,
+    active_patch_unit_ids: set[int],
 ) -> None:
-    if target_signatures:
-        missing_ids = patch_unit_ids - set(source_signatures)
-        reason = "source Unit has no parseable direct geometry"
+    if context.target_signatures:
+        missing_ids = active_patch_unit_ids - set(context.source_signatures)
+        reason = "patch Unit has no parseable mod geometry"
     else:
-        missing_ids = set(patch_unit_ids)
+        missing_ids = set(active_patch_unit_ids)
         reason = "target archive has no parseable direct Unit geometry"
     for file_id in sorted(missing_ids):
         result.missing.append(UnitGeometryIssue(file_id, reason))
@@ -203,32 +322,141 @@ def _record_missing_patch_units(
 
 def _assign_geometry_matches(
     result: UnitGeometryRemap,
-    source_signatures: Dict[int, UnitGeometrySignature],
-    target_signatures: Dict[int, UnitGeometrySignature],
-    patch_unit_ids: set[int],
+    context: UnitMatchContext,
+    active_patch_unit_ids: set[int],
     settings: GeometryMatchSettings,
 ) -> None:
-    rankings = _rank_all_sources(source_signatures, target_signatures)
-    _record_patch_rankings(result, rankings, patch_unit_ids, settings)
-    taken_targets: set[int] = set()
-    for source_id in _assignment_order(rankings, patch_unit_ids):
-        if _is_blocked_patch_source(result, source_id, patch_unit_ids):
-            continue
-        _assign_first_available(result, rankings[source_id], source_id, taken_targets, patch_unit_ids, settings)
+    taken_targets = apply_body_variant_pair_preassignment(
+        BodyPairPreassignmentRequest(
+            result=result,
+            source_signatures=context.source_signatures,
+            target_signatures=context.target_signatures,
+            source_names=context.source_names,
+            target_names=context.target_names,
+            target_variants=context.target_variants,
+            active_source_ids=active_patch_unit_ids,
+        )
+    )
+    preassigned_source_ids = set(result.expanded_remap)
+    for variant in _assignment_variants(context, active_patch_unit_ids):
+        remaining_source_ids = active_patch_unit_ids - preassigned_source_ids
+        rankings = _rank_all_sources_for_variant(context, variant)
+        _record_patch_rankings(result, rankings, remaining_source_ids, settings, variant)
+        assignments = _optimal_variant_assignments(rankings, remaining_source_ids, taken_targets, settings)
+        for source_id in _assignment_order(rankings, remaining_source_ids):
+            if _is_blocked_patch_source(result, source_id, remaining_source_ids):
+                continue
+            target_id = assignments.get(source_id)
+            if target_id is None:
+                _record_unassigned_source(result, source_id, variant)
+                continue
+            score = next(score for candidate_id, score in rankings[source_id] if candidate_id == target_id)
+            taken_targets.add(target_id)
+            result.claimed_target_file_ids.add(target_id)
+            _record_assigned_match(result, source_id, target_id, score, rankings[source_id], variant)
 
 
-def _rank_all_sources(
-    source_signatures: Dict[int, UnitGeometrySignature],
-    target_signatures: Dict[int, UnitGeometrySignature],
+def _assignment_variants(context: UnitMatchContext, active_patch_unit_ids: set[int]) -> List[str]:
+    variants = {
+        context.target_variants.get(file_id, "Any")
+        for file_id in context.target_signatures
+    }
+    variants.update(
+        context.source_variants.get(file_id, "Any")
+        for file_id in active_patch_unit_ids
+        if context.source_variants.get(file_id, "Any") != "Any"
+    )
+    if not variants:
+        variants.add("Any")
+    return [variant for variant in ("Unknown", "Any", "Stocky", "Slim") if variant in variants]
+
+
+def _rank_all_sources_for_variant(
+    context: UnitMatchContext,
+    variant: str,
 ) -> Dict[int, List[Tuple[int, float]]]:
+    targets = _target_signatures_for_variant(context, variant)
     rankings: Dict[int, List[Tuple[int, float]]] = {}
-    for source_id, signature in source_signatures.items():
+    for source_id, signature in context.source_signatures.items():
+        if not _source_can_apply_to_variant(context, source_id, variant):
+            continue
+        source_targets = _name_scoped_target_signatures(context, source_id, targets)
         ranked = [
             (target_id, score_signatures(signature, target_signature))
-            for target_id, target_signature in target_signatures.items()
+            for target_id, target_signature in source_targets.items()
         ]
         rankings[source_id] = sorted(ranked, key=lambda item: item[1])
     return rankings
+
+
+def _name_scoped_target_signatures(
+    context: UnitMatchContext,
+    source_id: int,
+    targets: Dict[int, UnitGeometrySignature],
+) -> Dict[int, UnitGeometrySignature]:
+    source_name = context.source_names.get(source_id)
+    exact_targets = {
+        target_id: signature
+        for target_id, signature in targets.items()
+        if _names_share_part_scope(source_name, context.target_names.get(target_id))
+    }
+    if exact_targets:
+        return exact_targets
+    return {
+        target_id: signature
+        for target_id, signature in targets.items()
+        if _name_scope_allows(source_name, context.target_names.get(target_id))
+    }
+
+
+def _name_scope_allows(
+    source_name: Optional[UnitCustomizationName],
+    target_name: Optional[UnitCustomizationName],
+) -> bool:
+    if source_name is None or target_name is None:
+        return True
+    return _names_share_part_scope(source_name, target_name)
+
+
+def _names_share_part_scope(
+    source_name: Optional[UnitCustomizationName],
+    target_name: Optional[UnitCustomizationName],
+) -> bool:
+    if source_name is None or target_name is None:
+        return False
+    return (
+        source_name.slot == target_name.slot
+        and source_name.weight == target_name.weight
+        and source_name.piece_type == target_name.piece_type
+    )
+
+
+def _target_signatures_for_variant(
+    context: UnitMatchContext,
+    variant: str,
+) -> Dict[int, UnitGeometrySignature]:
+    return {
+        file_id: signature
+        for file_id, signature in context.target_signatures.items()
+        if _target_can_receive_variant(context.target_variants.get(file_id, "Unknown"), variant)
+    }
+
+
+def _target_can_receive_variant(target_variant: str, requested_variant: str) -> bool:
+    if target_variant == requested_variant:
+        return True
+    return requested_variant in {"Stocky", "Slim"} and target_variant == "Unknown"
+
+
+def _source_can_apply_to_variant(
+    context: UnitMatchContext,
+    source_id: int,
+    variant: str,
+) -> bool:
+    source_variant = context.source_variants.get(source_id, "Any")
+    if source_variant == "Any":
+        return variant != "Unknown"
+    return source_variant == variant
 
 
 def _record_patch_rankings(
@@ -236,18 +464,30 @@ def _record_patch_rankings(
     rankings: Dict[int, List[Tuple[int, float]]],
     patch_unit_ids: set[int],
     settings: GeometryMatchSettings,
+    variant: str = "Any",
 ) -> None:
     for source_id in sorted(patch_unit_ids & set(rankings)):
         ranked = rankings[source_id]
-        result.rankings[source_id] = tuple(ranked[:3])
+        result.rankings[source_id] = _merge_rankings(result.rankings.get(source_id, ()), ranked)
         issue = _ranking_issue(source_id, ranked, settings)
         if issue is None:
             continue
         target_list = tuple(target_id for target_id, _score in ranked[:3])
+        reason = f"{issue} for {variant} target variant"
         if issue == "ambiguous geometry match":
-            result.ambiguous.append(UnitGeometryIssue(source_id, issue, target_list))
+            result.ambiguous.append(UnitGeometryIssue(source_id, reason, target_list))
         else:
-            result.missing.append(UnitGeometryIssue(source_id, issue, target_list))
+            result.missing.append(UnitGeometryIssue(source_id, reason, target_list))
+
+
+def _merge_rankings(
+    current: Tuple[Tuple[int, float], ...],
+    ranked: List[Tuple[int, float]],
+) -> Tuple[Tuple[int, float], ...]:
+    merged = {target_id: score for target_id, score in current}
+    for target_id, score in ranked[:3]:
+        merged[target_id] = min(score, merged.get(target_id, score))
+    return tuple(sorted(merged.items(), key=lambda item: item[1])[:3])
 
 
 def _ranking_issue(
@@ -269,13 +509,90 @@ def _assignment_order(
     patch_unit_ids: set[int],
 ) -> List[int]:
     return sorted(
-        rankings,
+        patch_unit_ids & set(rankings),
         key=lambda source_id: (
-            0 if source_id in patch_unit_ids else 1,
             rankings[source_id][0][1] if rankings[source_id] else float("inf"),
             source_id,
         ),
     )
+
+
+def _optimal_variant_assignments(
+    rankings: Dict[int, List[Tuple[int, float]]],
+    patch_unit_ids: set[int],
+    taken_targets: set[int],
+    settings: GeometryMatchSettings,
+) -> Dict[int, int]:
+    source_ids = _assignable_source_ids(rankings, patch_unit_ids)
+    candidates = _assignment_candidates(rankings, source_ids, taken_targets, settings)
+    if any(not candidates[source_id] for source_id in source_ids):
+        return {}
+    target_ids = sorted({target_id for values in candidates.values() for target_id, _ in values})
+    return _solve_assignment(source_ids, target_ids, candidates)
+
+
+def _assignable_source_ids(
+    rankings: Dict[int, List[Tuple[int, float]]],
+    patch_unit_ids: set[int],
+) -> Tuple[int, ...]:
+    return tuple(
+        sorted(
+            patch_unit_ids & set(rankings),
+            key=lambda source_id: (len(rankings[source_id]), source_id),
+        )
+    )
+
+
+def _assignment_candidates(
+    rankings: Dict[int, List[Tuple[int, float]]],
+    source_ids: Tuple[int, ...],
+    taken_targets: set[int],
+    settings: GeometryMatchSettings,
+) -> Dict[int, Tuple[Tuple[int, float], ...]]:
+    return {
+        source_id: tuple(
+            (target_id, score)
+            for target_id, score in rankings[source_id]
+            if target_id not in taken_targets and score <= settings.max_score
+        )
+        for source_id in source_ids
+    }
+
+
+def _solve_assignment(
+    source_ids: Tuple[int, ...],
+    target_ids: List[int],
+    candidates: Dict[int, Tuple[Tuple[int, float], ...]],
+) -> Dict[int, int]:
+    target_index = {target_id: index for index, target_id in enumerate(target_ids)}
+    score_by_pair = {
+        (source_id, target_index[target_id]): score
+        for source_id, values in candidates.items()
+        for target_id, score in values
+    }
+
+    @lru_cache(maxsize=None)
+    def best(source_pos: int, used_mask: int) -> Tuple[float, Tuple[int, ...]]:
+        if source_pos >= len(source_ids):
+            return 0.0, ()
+        source_id = source_ids[source_pos]
+        best_score = float("inf")
+        best_targets: Tuple[int, ...] = ()
+        for target_id, _ in candidates[source_id]:
+            index = target_index[target_id]
+            if used_mask & (1 << index):
+                continue
+            tail_score, tail_targets = best(source_pos + 1, used_mask | (1 << index))
+            total = score_by_pair[(source_id, index)] + tail_score
+            if total < best_score:
+                best_score = total
+                best_targets = (target_id,) + tail_targets
+        return best_score, best_targets
+
+    _score, assigned_targets = best(0, 0)
+    if len(assigned_targets) != len(source_ids):
+        return {}
+    return dict(zip(source_ids, assigned_targets))
 
 
 def _is_blocked_patch_source(
@@ -289,27 +606,45 @@ def _is_blocked_patch_source(
     return source_id in blocked
 
 
-def _assign_first_available(
+def _record_unassigned_source(
     result: UnitGeometryRemap,
-    ranked: List[Tuple[int, float]],
     source_id: int,
-    taken_targets: set[int],
-    patch_unit_ids: set[int],
-    settings: GeometryMatchSettings,
+    variant: str,
 ) -> None:
-    for target_id, score in ranked:
-        if target_id in taken_targets or score > settings.max_score:
-            continue
-        taken_targets.add(target_id)
-        result.claimed_target_file_ids.add(target_id)
-        if source_id in patch_unit_ids:
-            result.remap[source_id] = target_id
-            result.match_levels[source_id] = "geometry"
-            result.scores[source_id] = score
-            result.margins[source_id] = _margin_for_target(ranked, target_id)
-        return
-    if source_id in patch_unit_ids:
-        result.missing.append(UnitGeometryIssue(source_id, "no unclaimed target Unit geometry candidate"))
+    result.missing.append(
+        UnitGeometryIssue(
+            source_id,
+            f"no unclaimed target Unit geometry candidate for {variant} target variant",
+        )
+    )
+
+
+def _record_assigned_match(
+    result: UnitGeometryRemap,
+    source_id: int,
+    target_id: int,
+    score: float,
+    ranked: List[Tuple[int, float]],
+    variant: str,
+) -> None:
+    targets = result.expanded_remap.get(source_id, ())
+    result.expanded_remap[source_id] = targets + (target_id,)
+    result.remap.setdefault(source_id, target_id)
+    result.match_levels[source_id] = _append_match_level(
+        result.match_levels.get(source_id, ""),
+        f"geometry:{variant}",
+    )
+    if source_id not in result.scores or score < result.scores[source_id]:
+        result.scores[source_id] = score
+        result.margins[source_id] = _margin_for_target(ranked, target_id)
+
+
+def _append_match_level(current: str, level: str) -> str:
+    if not current:
+        return level
+    if level in current.split(","):
+        return current
+    return f"{current},{level}"
 
 
 def _margin_for_target(ranked: List[Tuple[int, float]], target_id: int) -> float:

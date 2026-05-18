@@ -176,8 +176,8 @@ def test_unsafe_non_unit_partial_remap_detection():
 def test_unit_geometry_remap_ignores_names_and_order():
     source = StreamToc()
     source.entries = [
-        _make_geometry_entry(0x01, _box_points(0, 0, 0, 1, 1, 1), b"wrong_name_arm"),
-        _make_geometry_entry(0x02, _line_points(0, 0, 0, 8, 0, 0), b"wrong_name_hip"),
+        TocEntry(file_id=0x01, type_id=UnitID),
+        TocEntry(file_id=0x02, type_id=UnitID),
     ]
     target = StreamToc()
     target.entries = [
@@ -186,8 +186,8 @@ def test_unit_geometry_remap_ignores_names_and_order():
     ]
     patch = StreamToc()
     patch.entries = [
-        TocEntry(file_id=0x01, type_id=UnitID, toc_data=b""),
-        TocEntry(file_id=0x02, type_id=UnitID, toc_data=b""),
+        _make_geometry_entry(0x01, _box_points(0, 0, 0, 1, 1, 1), b"wrong_name_arm"),
+        _make_geometry_entry(0x02, _line_points(0, 0, 0, 8, 0, 0), b"wrong_name_hip"),
     ]
 
     result = build_unit_geometry_remap(patch, source, target)
@@ -196,16 +196,33 @@ def test_unit_geometry_remap_ignores_names_and_order():
     print("  Unit geometry remap ignores names/order OK")
 
 
+def test_unit_geometry_uses_patch_mod_geometry():
+    source = StreamToc()
+    source.entries = [_make_geometry_entry(0x01, _line_points(20, 0, 0, 30, 0, 0))]
+    target = StreamToc()
+    target.entries = [
+        _make_geometry_entry(0x11, _line_points(20, 0, 0, 30, 0, 0)),
+        _make_geometry_entry(0x22, _box_points(0, 0, 0, 1, 1, 1)),
+    ]
+    patch = StreamToc()
+    patch.entries = [_make_geometry_entry(0x01, _box_points(0, 0, 0, 1, 1, 1))]
+
+    result = build_unit_geometry_remap(patch, source, target)
+    assert result.is_complete(), result
+    assert result.remap == {0x01: 0x22}, result.remap
+    print("  Unit geometry uses patch mod geometry OK")
+
+
 def test_unit_geometry_prefers_distribution_over_centroid():
     source = StreamToc()
-    source.entries = [_make_geometry_entry(0x01, _line_points(0, 0, 0, 10, 0, 0))]
+    source.entries = [TocEntry(file_id=0x01, type_id=UnitID)]
     target = StreamToc()
     target.entries = [
         _make_geometry_entry(0x11, _cluster_points(5, 0, 0)),
         _make_geometry_entry(0x22, _line_points(0, 0, 0, 10, 0, 0)),
     ]
     patch = StreamToc()
-    patch.entries = [TocEntry(file_id=0x01, type_id=UnitID, toc_data=b"")]
+    patch.entries = [_make_geometry_entry(0x01, _line_points(0, 0, 0, 10, 0, 0))]
 
     result = build_unit_geometry_remap(patch, source, target)
     assert result.is_complete(), result
@@ -215,14 +232,14 @@ def test_unit_geometry_prefers_distribution_over_centroid():
 
 def test_unit_geometry_blocks_ambiguous_candidates():
     source = StreamToc()
-    source.entries = [_make_geometry_entry(0x01, _box_points(0, 0, 0, 1, 1, 1))]
+    source.entries = [TocEntry(file_id=0x01, type_id=UnitID)]
     target = StreamToc()
     target.entries = [
         _make_geometry_entry(0x11, _box_points(0, 0, 0, 1, 1, 1)),
         _make_geometry_entry(0x22, _box_points(0, 0, 0, 1, 1, 1)),
     ]
     patch = StreamToc()
-    patch.entries = [TocEntry(file_id=0x01, type_id=UnitID, toc_data=b"")]
+    patch.entries = [_make_geometry_entry(0x01, _box_points(0, 0, 0, 1, 1, 1))]
 
     result = build_unit_geometry_remap(
         patch,
@@ -238,8 +255,8 @@ def test_unit_geometry_blocks_ambiguous_candidates():
 def test_unit_geometry_reports_missing_and_extra_units():
     source = StreamToc()
     source.entries = [
-        _make_geometry_entry(0x01, _box_points(0, 0, 0, 1, 1, 1)),
-        TocEntry(file_id=0x02, type_id=UnitID, toc_data=b"not-a-unit"),
+        TocEntry(file_id=0x01, type_id=UnitID),
+        TocEntry(file_id=0x02, type_id=UnitID),
     ]
     target = StreamToc()
     target.entries = [
@@ -248,8 +265,8 @@ def test_unit_geometry_reports_missing_and_extra_units():
     ]
     patch = StreamToc()
     patch.entries = [
-        TocEntry(file_id=0x01, type_id=UnitID, toc_data=b""),
-        TocEntry(file_id=0x02, type_id=UnitID, toc_data=b""),
+        _make_geometry_entry(0x01, _box_points(0, 0, 0, 1, 1, 1)),
+        TocEntry(file_id=0x02, type_id=UnitID, toc_data=b"not-a-unit"),
     ]
 
     result = build_unit_geometry_remap(patch, source, target)
@@ -258,6 +275,95 @@ def test_unit_geometry_reports_missing_and_extra_units():
     assert {issue.source_file_id for issue in result.missing} == {0x02}
     assert result.extra_unit_file_ids == [0x33], result.extra_unit_file_ids
     print("  Unit geometry missing/extra diagnostics OK")
+
+
+def test_unit_geometry_expands_any_to_body_variants():
+    source = StreamToc()
+    source.entries = [TocEntry(file_id=0x01, type_id=UnitID)]
+    target = StreamToc()
+    target.entries = [
+        _make_geometry_entry(0x11, _box_points(0, 0, 0, 1, 1, 1), _custom_marker("Stocky")),
+        _make_geometry_entry(0x22, _box_points(0, 0, 0, 1, 1, 1), _custom_marker("Slim")),
+    ]
+    patch = StreamToc()
+    patch.entries = [_make_geometry_entry(0x01, _box_points(0, 0, 0, 1, 1, 1), _custom_marker("Any"))]
+
+    result = build_unit_geometry_remap(patch, source, target)
+    assert result.is_complete(), result
+    assert result.expanded_remap == {0x01: (0x11, 0x22)}, result.expanded_remap
+    assert result.extra_unit_file_ids == [], result.extra_unit_file_ids
+    print("  Unit geometry Any variant expansion OK")
+
+
+def test_unit_geometry_respects_specific_body_variant():
+    source = StreamToc()
+    source.entries = [TocEntry(file_id=0x01, type_id=UnitID)]
+    target = StreamToc()
+    target.entries = [
+        _make_geometry_entry(0x11, _box_points(0, 0, 0, 1, 1, 1), _custom_marker("Stocky")),
+        _make_geometry_entry(0x22, _box_points(0, 0, 0, 1, 1, 1), _custom_marker("Slim")),
+    ]
+    patch = StreamToc()
+    patch.entries = [_make_geometry_entry(0x01, _box_points(0, 0, 0, 1, 1, 1), _custom_marker("Stocky"))]
+
+    result = build_unit_geometry_remap(patch, source, target)
+    assert result.is_complete(), result
+    assert result.expanded_remap == {0x01: (0x11,)}, result.expanded_remap
+    assert result.extra_unit_file_ids == [0x22], result.extra_unit_file_ids
+    print("  Unit geometry specific body variant OK")
+
+
+def test_unit_geometry_filters_structured_name_scope():
+    source = StreamToc()
+    source.entries = [TocEntry(file_id=0x01, type_id=UnitID)]
+    target = StreamToc()
+    target.entries = [
+        _make_geometry_entry(0x11, _box_points(0, 0, 0, 1, 1, 1), _custom_marker("Slim", "Torso")),
+        _make_geometry_entry(0x22, _line_points(0, 0, 0, 8, 0, 0), _custom_marker("Slim", "Hip")),
+    ]
+    patch = StreamToc()
+    patch.entries = [
+        _make_geometry_entry(0x01, _box_points(0, 0, 0, 1, 1, 1), _custom_marker("Slim", "Hip")),
+    ]
+
+    result = build_unit_geometry_remap(patch, source, target)
+    assert result.is_complete(), result
+    assert result.remap == {0x01: 0x22}, result.remap
+    print("  Unit geometry structured name scope OK")
+
+
+def test_unit_geometry_preassigns_identical_body_pair():
+    source = StreamToc()
+    source.entries = [
+        TocEntry(file_id=0x01, type_id=UnitID),
+        TocEntry(file_id=0x02, type_id=UnitID),
+    ]
+    target = StreamToc()
+    target.entries = [
+        _make_geometry_entry(0x11, _box_points(0, 0, 0, 1, 1, 1.02)),
+        _make_geometry_entry(0x22, _box_points(0, 0, 0, 1, 1, 1)),
+        _make_geometry_entry(0x33, _cluster_points(0.5, 0.5, 0.5)),
+    ]
+    patch = StreamToc()
+    patch.entries = [
+        _make_geometry_entry(0x01, _box_points(0, 0, 0, 1, 1, 1), _custom_marker("Stocky", "RightArm")),
+        _make_geometry_entry(0x02, _box_points(0, 0, 0, 1, 1, 1), _custom_marker("Slim", "RightArm")),
+    ]
+
+    result = build_unit_geometry_remap(patch, source, target)
+    assert result.is_complete(), result
+    assert result.remap == {0x01: 0x11, 0x02: 0x22}, result.remap
+    assert "body-pair" in result.match_levels[0x01], result.match_levels
+    print("  Unit geometry identical body pair preassignment OK")
+
+
+def _custom_marker(body_type: str, slot: str = "RightLeg") -> bytes:
+    return (
+        f"HelldiverCustomizationBodyType_{body_type}\x00"
+        f"HelldiverCustomizationSlot_{slot}\x00"
+        "HelldiverCustomizationWeight_Medium\x00"
+        "HelldiverCustomizationPieceType_Undergarment\x00"
+    ).encode("utf-8")
 
 
 def _box_points(x: float, y: float, z: float, sx: float, sy: float, sz: float) -> list:
@@ -301,7 +407,12 @@ if __name__ == "__main__":
     test_streamtoc_roundtrip()
     test_unsafe_non_unit_partial_remap_detection()
     test_unit_geometry_remap_ignores_names_and_order()
+    test_unit_geometry_uses_patch_mod_geometry()
     test_unit_geometry_prefers_distribution_over_centroid()
     test_unit_geometry_blocks_ambiguous_candidates()
     test_unit_geometry_reports_missing_and_extra_units()
+    test_unit_geometry_expands_any_to_body_variants()
+    test_unit_geometry_respects_specific_body_variant()
+    test_unit_geometry_filters_structured_name_scope()
+    test_unit_geometry_preassigns_identical_body_pair()
     print("ALL PASS")

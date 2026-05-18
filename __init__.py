@@ -48,6 +48,7 @@ from .utils import hashing as hash_m
 from .utils import memoryStream as memoryStream_m
 from .utils import logger as logger_m
 from .utils import constants as constants_m
+from .utils import vertex_group_mapper as vertex_group_mapper_m
 
 importlib.reload(constants_m)
 importlib.reload(memoryStream_m)
@@ -63,6 +64,7 @@ importlib.reload(unit_m)
 importlib.reload(hash_m)
 importlib.reload(slim_m)
 importlib.reload(state_machine_m)
+importlib.reload(vertex_group_mapper_m)
 
 from .stingray.animation import StingrayAnimation, AnimationException
 from .stingray.raw_dump import StingrayRawDump
@@ -79,6 +81,7 @@ from .utils.hashing import murmur64_hash
 from .utils.memoryStream import MemoryStream
 from .utils.logger import PrettyPrint
 from .utils.constants import *
+from .utils.vertex_group_mapper import rename_vertex_groups_by_position
 
 #endregion
 
@@ -2295,6 +2298,109 @@ class LoadPlayerAvatarOperator(Operator):
             if area.type == "VIEW_3D": area.tag_redraw()
         
         return{'FINISHED'}
+
+class RenameVertexGroupsByPositionOperator(Operator):
+    bl_label = "Rename Vertex Groups by Position"
+    bl_idname = "helldiver2.rename_vertex_groups_by_position"
+    bl_description = "Rename active mesh vertex groups by matching them to a chosen HD2 reference mesh"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    reference_object: StringProperty(
+        name="Reference Mesh",
+        description="HD2 mesh whose vertex group names will be matched onto the active mesh",
+        default="",
+    )
+    debug: BoolProperty(
+        name="Debug Log",
+        description="Print per-group top-3 scoring to the console",
+        default=False,
+    )
+
+    def invoke(self, context, event):
+        if self.reference_object == "":
+            _, reference, _ = ResolveVertexGroupRenameObjects(context, self.reference_object)
+            if reference is not None:
+                self.reference_object = reference.name
+        return context.window_manager.invoke_props_dialog(self)
+
+    def draw(self, context):
+        layout = self.layout
+        active = context.active_object
+        if active is None or active.type != 'MESH':
+            layout.label(text="Active object must be a mesh.", icon='ERROR')
+            return
+        layout.label(text=f"Target: {active.name}", icon='OUTLINER_OB_MESH')
+        layout.prop_search(self, "reference_object", bpy.data, "objects", text="Reference")
+        layout.prop(self, "debug")
+
+    def execute(self, context):
+        target, reference, error = ResolveVertexGroupRenameObjects(context, self.reference_object)
+        if error:
+            self.report({'ERROR'}, error)
+            return {'CANCELLED'}
+        result = rename_vertex_groups_by_position(target, reference)
+        LogVertexGroupRenameDetails(result, self.debug)
+        self.report({VertexGroupRenameReportType(result)}, VertexGroupRenameReport(result))
+        return {'FINISHED'}
+
+def ResolveVertexGroupRenameObjects(context, reference_name):
+    active = context.active_object
+    if active is None or active.type != 'MESH':
+        return None, None, "The active object must be the mesh to rename."
+    reference = PickedReferenceObject(reference_name)
+    if reference is None:
+        reference = InferReferenceFromSelection(context, active)
+    if reference is None:
+        return active, None, "Pick a reference mesh (or select exactly two mesh objects)."
+    if reference == active:
+        return active, None, "Reference mesh must differ from the target mesh."
+    if reference.type != 'MESH':
+        return active, None, f"{reference.name} is not a mesh."
+    return ValidateVertexGroupRenameObjects(active, reference)
+
+def PickedReferenceObject(reference_name):
+    if not reference_name:
+        return None
+    return bpy.data.objects.get(reference_name)
+
+def InferReferenceFromSelection(context, active):
+    meshes = [obj for obj in context.selected_objects if obj.type == 'MESH' and obj != active]
+    if len(meshes) == 1:
+        return meshes[0]
+    return None
+
+def ValidateVertexGroupRenameObjects(target, reference):
+    if len(target.vertex_groups) == 0:
+        return target, reference, f"{target.name} has no vertex groups to rename."
+    if len(reference.vertex_groups) == 0:
+        return target, reference, f"{reference.name} has no vertex groups."
+    return target, reference, None
+
+def VertexGroupRenameReport(result):
+    skipped = len(result.skipped)
+    renamed = len(result.renamed)
+    return f"Renamed {renamed} vertex groups, skipped {skipped}, split matches {result.conflicts}."
+
+def VertexGroupRenameReportType(result):
+    if len(result.renamed) == 0:
+        return 'WARNING'
+    if len(result.skipped) > 0:
+        return 'WARNING'
+    return 'INFO'
+
+def LogVertexGroupRenameDetails(result, debug):
+    for old_name, new_name in result.renamed:
+        PrettyPrint(f"Renamed vertex group: {old_name} -> {new_name}")
+    if len(result.skipped) > 0:
+        PrettyPrint(f"Skipped vertex groups: {', '.join(result.skipped)}", "warn")
+    if debug:
+        LogVertexGroupRenameDiagnostics(result)
+
+def LogVertexGroupRenameDiagnostics(result):
+    PrettyPrint(f"[vg-rename] reference_scale={result.scale:.4f} target_samples={result.target_count} reference_samples={result.reference_groups}")
+    for diagnostic in result.diagnostics:
+        rankings = ", ".join(f"{name}={score:.3f}" for name, score in diagnostic.rankings)
+        PrettyPrint(f"[vg-rename] {diagnostic.source_name} status={diagnostic.status} score={diagnostic.score:.3f} margin={diagnostic.margin:.3f} top=[{rankings}]")
 #endregion
 
 #region Operators: Entries
@@ -4149,6 +4255,8 @@ def CustomPropertyContext(self, context):
     layout.operator("helldiver2.copy_custom_properties", icon= 'COPYDOWN')
     layout.operator("helldiver2.paste_custom_properties", icon= 'PASTEDOWN')
     layout.separator()
+    layout.operator("helldiver2.rename_vertex_groups_by_position", icon='GROUP_VERTEX')
+    layout.separator()
     
     FileIDStr = ""
     TypeIDStr = ""
@@ -4900,6 +5008,7 @@ class HellDivers2ToolsPanel(Panel):
         row = layout.row(); row = layout.row()
         row.operator("helldiver2.archive_import_default", icon= 'SOLO_ON', text="")
         row.operator("helldiver2.archive_import_avatar", icon= 'OUTLINER_OB_ARMATURE', text="")
+        row.operator("helldiver2.rename_vertex_groups_by_position", icon='GROUP_VERTEX', text="")
         row.operator("helldiver2.search_archives", icon= 'VIEWZOOM')
         row.operator("helldiver2.archive_unloadall", icon= 'FILE_REFRESH', text="")
         row = layout.row()
@@ -5464,6 +5573,7 @@ classes = (
     AddLightOperator,
     ViewChangelogOperator,
     LoadPlayerAvatarOperator,
+    RenameVertexGroupsByPositionOperator,
     StateMachineAnimationIDOperator,
 )
 

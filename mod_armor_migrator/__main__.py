@@ -53,8 +53,7 @@ def main(argv=None) -> int:
     p.add_argument("--experimental-partial-remap", action="store_true",
                    help="Mode A only: write a diagnostic patch even when automatic "
                         "geometry remap is incomplete. Unmatched Unit entries are "
-                        "skipped; unsafe non-Unit ordinal remaps are kept with "
-                        "warnings. Intended for manual in-game testing.")
+                        "skipped. Intended for manual in-game testing.")
 
     p.add_argument("--empty-mesh-from", default=None,
                    help="Path to a patch file from which to extract the empty-Unit "

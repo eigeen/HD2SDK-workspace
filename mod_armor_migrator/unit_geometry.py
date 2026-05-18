@@ -341,8 +341,15 @@ def _assign_geometry_matches(
     for variant in _assignment_variants(context, active_patch_unit_ids):
         remaining_source_ids = active_patch_unit_ids - preassigned_source_ids
         rankings = _rank_all_sources_for_variant(context, variant)
-        _record_patch_rankings(result, rankings, remaining_source_ids, settings, variant)
-        assignments = _optimal_variant_assignments(rankings, remaining_source_ids, taken_targets, settings)
+        trusted_source_ids = _trusted_exact_source_ids(context, rankings, variant)
+        _record_patch_rankings(result, rankings, remaining_source_ids, settings, variant, trusted_source_ids)
+        assignments = _optimal_variant_assignments(
+            rankings,
+            remaining_source_ids,
+            taken_targets,
+            settings,
+            trusted_source_ids,
+        )
         for source_id in _assignment_order(rankings, remaining_source_ids):
             if _is_blocked_patch_source(result, source_id, remaining_source_ids):
                 continue
@@ -395,6 +402,13 @@ def _name_scoped_target_signatures(
     targets: Dict[int, UnitGeometrySignature],
 ) -> Dict[int, UnitGeometrySignature]:
     source_name = context.source_names.get(source_id)
+    preferred_targets = {
+        target_id: signature
+        for target_id, signature in targets.items()
+        if _names_share_slot_and_piece(source_name, context.target_names.get(target_id))
+    }
+    if preferred_targets:
+        return preferred_targets
     exact_targets = {
         target_id: signature
         for target_id, signature in targets.items()
@@ -406,6 +420,56 @@ def _name_scoped_target_signatures(
         target_id: signature
         for target_id, signature in targets.items()
         if _name_scope_allows(source_name, context.target_names.get(target_id))
+    }
+
+
+def _trusted_exact_source_ids(
+    context: UnitMatchContext,
+    rankings: Dict[int, List[Tuple[int, float]]],
+    variant: str,
+) -> set[int]:
+    targets = _target_signatures_for_variant(context, variant)
+    trusted: set[int] = set()
+    for source_id in rankings:
+        if _has_unique_trusted_part_target(context, source_id, targets):
+            trusted.add(source_id)
+    return trusted
+
+
+def _has_unique_trusted_part_target(
+    context: UnitMatchContext,
+    source_id: int,
+    targets: Dict[int, UnitGeometrySignature],
+) -> bool:
+    preferred_targets = _slot_and_piece_target_ids(context, source_id, targets)
+    if preferred_targets:
+        return len(preferred_targets) == 1
+    return len(_exact_part_target_ids(context, source_id, targets)) == 1
+
+
+def _slot_and_piece_target_ids(
+    context: UnitMatchContext,
+    source_id: int,
+    targets: Dict[int, UnitGeometrySignature],
+) -> set[int]:
+    source_name = context.source_names.get(source_id)
+    return {
+        target_id
+        for target_id in targets
+        if _names_share_slot_and_piece(source_name, context.target_names.get(target_id))
+    }
+
+
+def _exact_part_target_ids(
+    context: UnitMatchContext,
+    source_id: int,
+    targets: Dict[int, UnitGeometrySignature],
+) -> set[int]:
+    source_name = context.source_names.get(source_id)
+    return {
+        target_id
+        for target_id in targets
+        if _names_share_part_scope(source_name, context.target_names.get(target_id))
     }
 
 
@@ -424,9 +488,17 @@ def _names_share_part_scope(
 ) -> bool:
     if source_name is None or target_name is None:
         return False
+    return source_name.slot == target_name.slot
+
+
+def _names_share_slot_and_piece(
+    source_name: Optional[UnitCustomizationName],
+    target_name: Optional[UnitCustomizationName],
+) -> bool:
+    if source_name is None or target_name is None:
+        return False
     return (
         source_name.slot == target_name.slot
-        and source_name.weight == target_name.weight
         and source_name.piece_type == target_name.piece_type
     )
 
@@ -465,11 +537,13 @@ def _record_patch_rankings(
     patch_unit_ids: set[int],
     settings: GeometryMatchSettings,
     variant: str = "Any",
+    trusted_source_ids: Optional[set[int]] = None,
 ) -> None:
+    trusted_ids = trusted_source_ids or set()
     for source_id in sorted(patch_unit_ids & set(rankings)):
         ranked = rankings[source_id]
         result.rankings[source_id] = _merge_rankings(result.rankings.get(source_id, ()), ranked)
-        issue = _ranking_issue(source_id, ranked, settings)
+        issue = _ranking_issue(source_id, ranked, settings, source_id in trusted_ids)
         if issue is None:
             continue
         target_list = tuple(target_id for target_id, _score in ranked[:3])
@@ -494,10 +568,11 @@ def _ranking_issue(
     source_id: int,
     ranked: List[Tuple[int, float]],
     settings: GeometryMatchSettings,
+    trusted_exact: bool = False,
 ) -> Optional[str]:
     if not ranked:
         return "no target Unit geometry candidates"
-    if ranked[0][1] > settings.max_score:
+    if ranked[0][1] > settings.max_score and not trusted_exact:
         return "best geometry match exceeds score threshold"
     if len(ranked) > 1 and ranked[1][1] - ranked[0][1] < settings.min_margin:
         return "ambiguous geometry match"
@@ -522,9 +597,10 @@ def _optimal_variant_assignments(
     patch_unit_ids: set[int],
     taken_targets: set[int],
     settings: GeometryMatchSettings,
+    trusted_source_ids: set[int],
 ) -> Dict[int, int]:
     source_ids = _assignable_source_ids(rankings, patch_unit_ids)
-    candidates = _assignment_candidates(rankings, source_ids, taken_targets, settings)
+    candidates = _assignment_candidates(rankings, source_ids, taken_targets, settings, trusted_source_ids)
     if any(not candidates[source_id] for source_id in source_ids):
         return {}
     target_ids = sorted({target_id for values in candidates.values() for target_id, _ in values})
@@ -548,12 +624,14 @@ def _assignment_candidates(
     source_ids: Tuple[int, ...],
     taken_targets: set[int],
     settings: GeometryMatchSettings,
+    trusted_source_ids: set[int],
 ) -> Dict[int, Tuple[Tuple[int, float], ...]]:
     return {
         source_id: tuple(
             (target_id, score)
             for target_id, score in rankings[source_id]
-            if target_id not in taken_targets and score <= settings.max_score
+            if target_id not in taken_targets
+            and (score <= settings.max_score or source_id in trusted_source_ids)
         )
         for source_id in source_ids
     }

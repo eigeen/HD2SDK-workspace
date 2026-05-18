@@ -47,8 +47,9 @@ For each entry in the mod patch:
 The raw GPU/Stream payloads (vertex buffers, DDS pixel data) are copied
 through untouched — that *is* the mod's content.
 
-If source and target have differing counts for a non-Unit TypeID, that type is
-skipped for that target (with a warning); Unit count differences are handled by
+If source and target have differing counts for a non-Unit TypeID, the tool logs
+a warning and keeps the safe ordinal portion of that type. Source entries
+without a target slot are skipped; Unit count differences are handled by
 geometry matching plus empty-mesh padding for target-only parts.
 
 ## Usage

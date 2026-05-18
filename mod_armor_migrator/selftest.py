@@ -12,7 +12,7 @@ import tempfile
 
 from .archive import StreamToc, TocEntry
 from .constants import UnitID, MaterialID, BoneID, TexID
-from .migrator import RemapPlan, _find_unsafe_partial_types
+from .migrator import ArmorEntry, migrate_one
 from .unit_geometry import GeometryMatchSettings, build_unit_geometry_remap
 from . import refs
 
@@ -158,19 +158,32 @@ def test_streamtoc_roundtrip():
     print("  StreamToc round-trip OK")
 
 
-def test_unsafe_non_unit_partial_remap_detection():
+def test_non_unit_count_mismatch_does_not_block():
     source = StreamToc()
     source.entries = [
         TocEntry(file_id=0x01, type_id=MaterialID),
         TocEntry(file_id=0x02, type_id=MaterialID),
     ]
+    target = StreamToc()
+    target.entries = [
+        TocEntry(file_id=0x11, type_id=MaterialID),
+        TocEntry(file_id=0x12, type_id=MaterialID),
+        TocEntry(file_id=0x13, type_id=MaterialID),
+    ]
     patch = StreamToc()
-    patch.entries = [TocEntry(file_id=0x01, type_id=MaterialID)]
-
-    plan = RemapPlan({}, [], {MaterialID: (2, 3)}, set(), [])
-    unsafe = _find_unsafe_partial_types(patch, source, plan)
-    assert unsafe == [MaterialID], unsafe
-    print("  unsafe non-Unit partial remap detection OK")
+    patch.entries = [
+        TocEntry(file_id=0x01, type_id=MaterialID, toc_data=b"\x00" * 16),
+    ]
+    with tempfile.TemporaryDirectory() as out_dir:
+        report = migrate_one(
+            patch,
+            source,
+            target,
+            ArmorEntry("target", "Target"),
+            out_dir,
+        )
+    assert report.written_entries == 1, report
+    print("  non-Unit count mismatch warning-only migration OK")
 
 
 def test_unit_geometry_remap_ignores_names_and_order():
@@ -332,6 +345,60 @@ def test_unit_geometry_filters_structured_name_scope():
     print("  Unit geometry structured name scope OK")
 
 
+def test_unit_geometry_trusts_unique_structured_target():
+    source = StreamToc()
+    source.entries = [TocEntry(file_id=0x01, type_id=UnitID)]
+    target = StreamToc()
+    target.entries = [
+        _make_geometry_entry(0x11, _line_points(20, 0, 0, 30, 0, 0), _custom_marker("Slim", "RightArm")),
+    ]
+    patch = StreamToc()
+    patch.entries = [
+        _make_geometry_entry(0x01, _box_points(0, 0, 0, 1, 1, 1), _custom_marker("Slim", "RightArm")),
+    ]
+
+    result = build_unit_geometry_remap(
+        patch,
+        source,
+        target,
+        GeometryMatchSettings(max_score=0.01),
+    )
+    assert result.is_complete(), result
+    assert result.remap == {0x01: 0x11}, result.remap
+    print("  Unit geometry trusts unique structured target OK")
+
+
+def test_unit_geometry_ignores_weight_and_piece_type_for_slot_scope():
+    source = StreamToc()
+    source.entries = [TocEntry(file_id=0x01, type_id=UnitID)]
+    target = StreamToc()
+    target.entries = [
+        _make_geometry_entry(
+            0x11,
+            _line_points(20, 0, 0, 30, 0, 0),
+            _custom_marker("Slim", "Torso", "Heavy", "Armor"),
+        ),
+    ]
+    patch = StreamToc()
+    patch.entries = [
+        _make_geometry_entry(
+            0x01,
+            _box_points(0, 0, 0, 1, 1, 1),
+            _custom_marker("Slim", "Torso", "Medium", "Undergarment"),
+        ),
+    ]
+
+    result = build_unit_geometry_remap(
+        patch,
+        source,
+        target,
+        GeometryMatchSettings(max_score=0.01),
+    )
+    assert result.is_complete(), result
+    assert result.remap == {0x01: 0x11}, result.remap
+    print("  Unit geometry ignores weight/piece for slot scope OK")
+
+
 def test_unit_geometry_preassigns_identical_body_pair():
     source = StreamToc()
     source.entries = [
@@ -357,12 +424,17 @@ def test_unit_geometry_preassigns_identical_body_pair():
     print("  Unit geometry identical body pair preassignment OK")
 
 
-def _custom_marker(body_type: str, slot: str = "RightLeg") -> bytes:
+def _custom_marker(
+    body_type: str,
+    slot: str = "RightLeg",
+    weight: str = "Medium",
+    piece_type: str = "Undergarment",
+) -> bytes:
     return (
         f"HelldiverCustomizationBodyType_{body_type}\x00"
         f"HelldiverCustomizationSlot_{slot}\x00"
-        "HelldiverCustomizationWeight_Medium\x00"
-        "HelldiverCustomizationPieceType_Undergarment\x00"
+        f"HelldiverCustomizationWeight_{weight}\x00"
+        f"HelldiverCustomizationPieceType_{piece_type}\x00"
     ).encode("utf-8")
 
 
@@ -405,7 +477,7 @@ if __name__ == "__main__":
     print("self-test:")
     test_refs_roundtrip()
     test_streamtoc_roundtrip()
-    test_unsafe_non_unit_partial_remap_detection()
+    test_non_unit_count_mismatch_does_not_block()
     test_unit_geometry_remap_ignores_names_and_order()
     test_unit_geometry_uses_patch_mod_geometry()
     test_unit_geometry_prefers_distribution_over_centroid()
@@ -414,5 +486,7 @@ if __name__ == "__main__":
     test_unit_geometry_expands_any_to_body_variants()
     test_unit_geometry_respects_specific_body_variant()
     test_unit_geometry_filters_structured_name_scope()
+    test_unit_geometry_trusts_unique_structured_target()
+    test_unit_geometry_ignores_weight_and_piece_type_for_slot_scope()
     test_unit_geometry_preassigns_identical_body_pair()
     print("ALL PASS")

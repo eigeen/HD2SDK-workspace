@@ -9,9 +9,9 @@ Armor Unit entries are matched by direct mesh geometry, not by archive order or
 embedded names. Unit migration uses explicit trusted remap JSON when supplied;
 otherwise the tool compares source/target Unit vertex distributions.
 
-For non-Unit resources that are structurally parallel, archive order is still
-used as a best-effort fallback. If the counts differ for a patch-used type,
-the migration is blocked instead of silently writing a wrong patch.
+For non-Unit resources that are structurally parallel, archive order is used
+as a best-effort fallback. Count mismatches are warnings; Unit mismatches still
+depend on geometry remap safety.
 """
 from __future__ import annotations
 
@@ -255,24 +255,20 @@ def migrate_one(
             if unit_remap.extra_unit_file_ids:
                 extra_unit_file_ids = unit_remap.extra_unit_file_ids
             unit_targets = unit_remap.expanded_remap
+            empty_remap, extra_unit_file_ids = _assign_empty_unit_placeholders(
+                patch,
+                unit_remap,
+            )
+            remap.update(empty_remap)
             skipped_file_ids.difference_update(unit_remap.remap.keys())
+            skipped_file_ids.difference_update(empty_remap.keys())
             _log_unit_geometry_remap(target_entry, unit_remap)
+            if empty_remap:
+                log.info("[%s] mapped %d empty source Unit placeholder(s)",
+                         target_entry.name, len(empty_remap))
             if write_file_ids is not None:
                 _log_patch_dependency_summary(target_entry, patch, write_file_ids)
             _log_referenced_texture_remaps(patch, source, remap, target_entry, write_file_ids)
-            unsafe_types = _find_unsafe_partial_types(patch, source, plan, write_file_ids)
-            if unsafe_types:
-                if not experimental_partial_remap:
-                    raise UnsafePartialRemapError(
-                        _format_unsafe_partial_message(target_entry, unsafe_types, plan)
-                    )
-                log.warning(
-                    "[%s] experimental partial remap keeps unsafe non-Unit "
-                    "ordinal fallback: %s",
-                    target_entry.name,
-                    _format_unsafe_type_counts(unsafe_types, plan),
-                )
-
     rewrite_context = _entry_rewrite_context(remap, slot_remap, unit_targets, (source, target))
     new_patch = StreamToc()
     written = 0
@@ -538,6 +534,31 @@ def _entry_rewrite_context(
     return EntryRewriteContext(remap, slot_remap, unit_targets, source_units, target_units)
 
 
+def _assign_empty_unit_placeholders(
+    patch: StreamToc,
+    unit_remap: UnitGeometryRemap,
+) -> Tuple[Dict[int, int], List[int]]:
+    """Map invisible source Unit placeholders onto unmatched target Unit slots."""
+    target_ids = list(unit_remap.extra_unit_file_ids)
+    assignments: Dict[int, int] = {}
+    for entry in _empty_patch_unit_entries(patch, unit_remap):
+        if not target_ids:
+            break
+        assignments[entry.file_id] = target_ids.pop(0)
+    return assignments, target_ids
+
+
+def _empty_patch_unit_entries(
+    patch: StreamToc,
+    unit_remap: UnitGeometryRemap,
+) -> List[Any]:
+    empty_ids = unit_remap.empty_source_file_ids
+    return [
+        entry for entry in patch.by_type().get(UnitID, [])
+        if entry.file_id in empty_ids
+    ]
+
+
 def _entry_target_file_ids(entry: Any, context: EntryRewriteContext) -> Tuple[int, ...]:
     """Return one or more output FileIDs for a patch entry."""
     if entry.type_id == UnitID and entry.file_id in context.unit_targets:
@@ -573,54 +594,6 @@ def _add_header_pair_remaps_silent(
         remap[source_ref] = target_ref
 
 
-def _find_unsafe_partial_types(
-    patch: StreamToc,
-    source: StreamToc,
-    plan: RemapPlan,
-    write_file_ids: Optional[set[int]] = None,
-) -> List[int]:
-    """Return patch-used types where archive-derived remap is not trustworthy."""
-    patch_ids_by_type = _patch_source_file_ids_by_type(patch, source, write_file_ids)
-    unsafe: List[int] = []
-    for tid, source_ids in patch_ids_by_type.items():
-        if tid == UnitID:
-            continue
-        src_count, tgt_count = plan.type_counts.get(tid, (0, 0))
-        if source_ids and src_count != tgt_count:
-            unsafe.append(tid)
-    return unsafe
-
-
-def _patch_source_file_ids_by_type(
-    patch: StreamToc,
-    source: StreamToc,
-    write_file_ids: Optional[set[int]] = None,
-) -> Dict[int, set[int]]:
-    """Group source archive FileIDs directly patched or referenced by patch data."""
-    source_ids = {(entry.type_id, entry.file_id) for entry in source.entries}
-    source_type_by_file_id = {entry.file_id: entry.type_id for entry in source.entries}
-    grouped: Dict[int, set[int]] = {}
-    for entry in patch.entries:
-        if write_file_ids is not None and entry.file_id not in write_file_ids:
-            continue
-        key = (entry.type_id, entry.file_id)
-        if key in source_ids:
-            grouped.setdefault(entry.type_id, set()).add(entry.file_id)
-        for ref_id in _entry_source_refs(entry, source_type_by_file_id):
-            grouped.setdefault(source_type_by_file_id[ref_id], set()).add(ref_id)
-    return grouped
-
-
-def _entry_source_refs(entry, source_type_by_file_id: Dict[int, int]) -> List[int]:
-    """Return source archive FileIDs referenced inside one patch entry."""
-    refs_in_entry: List[int] = []
-    if entry.type_id == UnitID:
-        refs_in_entry = refs.list_unit_refs(entry.toc_data)
-    elif entry.type_id == MaterialID:
-        refs_in_entry = refs.list_material_refs(entry.toc_data)
-    return [ref_id for ref_id in refs_in_entry if ref_id in source_type_by_file_id]
-
-
 def _patch_dependency_file_ids(patch: StreamToc, unit_file_ids: set[int]) -> set[int]:
     """Return patch entries reachable from migrated Unit entries."""
     patch_entries = {entry.file_id: entry for entry in patch.entries}
@@ -645,30 +618,6 @@ def _patch_refs(entry, patch_entries: Dict[int, Any]) -> List[int]:
     else:
         raw_refs = []
     return [ref_id for ref_id in raw_refs if ref_id in patch_entries]
-
-
-def _format_unsafe_partial_message(
-    target_entry: ArmorEntry,
-    unsafe_types: List[int],
-    plan: RemapPlan,
-) -> str:
-    """Describe why this migration needs an explicit reference remap."""
-    joined = _format_unsafe_type_counts(unsafe_types, plan)
-    return (
-        f"[{target_entry.name}] unsafe archive-derived remap: {joined}. "
-        "Archive order cannot be trusted for patch-used types with different "
-        "source/target counts. Use --reference-remap-json or --remap-json."
-    )
-
-
-def _format_unsafe_type_counts(unsafe_types: List[int], plan: RemapPlan) -> str:
-    """Return source/target count details for unsafe patch-used TypeIDs."""
-    details = []
-    for tid in unsafe_types:
-        src_count, tgt_count = plan.type_counts.get(tid, (0, 0))
-        name = TYPE_NAMES.get(tid, hex(tid))
-        details.append(f"{name} source={src_count} target={tgt_count}")
-    return "; ".join(details)
 
 
 def _format_unsafe_unit_geometry_message(

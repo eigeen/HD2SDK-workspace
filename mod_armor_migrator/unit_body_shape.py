@@ -28,6 +28,7 @@ class BodyPairPreassignmentRequest:
 _EXPANSION_SAMPLE_COUNT = 512
 _EXPANSION_THRESHOLD = 0.00005
 _PAIR_SCORE_LIMIT = 1.0
+_NAMED_UNKNOWN_PAIR_SCORE_LIMIT = 2.5
 _DEPTH_EXTENT_THRESHOLD = 0.0005
 
 
@@ -101,33 +102,48 @@ def _preassignable_source_pairs(
             continue
         if pair.slim_source_id not in request.source_signatures:
             continue
-        if _has_exact_part_target(request, pair):
+        if _has_complete_variant_part_targets(request, pair):
             continue
         pairs.append(pair)
     return tuple(pairs)
 
 
-def _has_exact_part_target(
+def _has_complete_variant_part_targets(
     request: BodyPairPreassignmentRequest,
     pair: BodyVariantPair,
 ) -> bool:
-    source_name = request.source_names.get(pair.stocky_source_id)
+    stocky_name = request.source_names.get(pair.stocky_source_id)
+    slim_name = request.source_names.get(pair.slim_source_id)
+    return _has_variant_part_target(request, stocky_name, "Stocky") and _has_variant_part_target(
+        request,
+        slim_name,
+        "Slim",
+    )
+
+
+def _has_variant_part_target(
+    request: BodyPairPreassignmentRequest,
+    source_name: Optional[UnitCustomizationName],
+    variant: str,
+) -> bool:
     if source_name is None:
         return False
-    return any(_same_part(source_name, name) for name in request.target_names.values())
+    return any(
+        target_name.body_variant() == variant and source_name.slot == target_name.slot
+        for target_name in request.target_names.values()
+        if target_name is not None
+    )
 
 
 def _same_part(
-    source_name: UnitCustomizationName,
+    source_name: Optional[UnitCustomizationName],
     target_name: Optional[UnitCustomizationName],
 ) -> bool:
-    if target_name is None:
+    if source_name is None or target_name is None:
         return False
-    return (
-        source_name.slot == target_name.slot
-        and source_name.weight == target_name.weight
-        and source_name.piece_type == target_name.piece_type
-    )
+    if source_name.slot != target_name.slot:
+        return False
+    return source_name.piece_type == target_name.piece_type
 
 
 def _unknown_near_twin_target_pairs(
@@ -153,15 +169,101 @@ def _body_pair_candidates(
 ) -> Dict[BodyVariantPair, Tuple[Tuple[Tuple[int, int], float], ...]]:
     candidates: Dict[BodyVariantPair, Tuple[Tuple[Tuple[int, int], float], ...]] = {}
     for pair in source_pairs:
+        scoped_pairs = _dedupe_target_pairs(
+            target_pairs + _named_unknown_near_twin_target_pairs(request, pair)
+        )
         ranked = [
             (targets, _body_pair_score(request, pair, targets))
-            for targets in target_pairs
+            for targets in scoped_pairs
         ]
         candidates[pair] = tuple(
             item for item in sorted(ranked, key=lambda value: value[1])
-            if item[1] <= _PAIR_SCORE_LIMIT
+            if _body_pair_candidate_allowed(request, pair, item[0], item[1])
         )
     return candidates
+
+
+def _body_pair_candidate_allowed(
+    request: BodyPairPreassignmentRequest,
+    pair: BodyVariantPair,
+    targets: Tuple[int, int],
+    score: float,
+) -> bool:
+    if score <= _PAIR_SCORE_LIMIT:
+        return True
+    if not _has_named_part_target_in_pair(request, pair, targets):
+        return False
+    return score <= _NAMED_UNKNOWN_PAIR_SCORE_LIMIT
+
+
+def _has_named_part_target_in_pair(
+    request: BodyPairPreassignmentRequest,
+    pair: BodyVariantPair,
+    targets: Tuple[int, int],
+) -> bool:
+    stocky_name = request.source_names.get(pair.stocky_source_id)
+    slim_name = request.source_names.get(pair.slim_source_id)
+    return any(
+        _named_target_matches_pair(stocky_name, slim_name, request.target_names.get(target_id))
+        for target_id in targets
+    )
+
+
+def _named_unknown_near_twin_target_pairs(
+    request: BodyPairPreassignmentRequest,
+    pair: BodyVariantPair,
+) -> Tuple[Tuple[int, int], ...]:
+    unknown_ids = _unknown_target_ids(request)
+    named_ids = _named_part_target_ids(request, pair)
+    return tuple(
+        (named_id, unknown_id)
+        for named_id in named_ids
+        for unknown_id in unknown_ids
+        if _targets_are_near_twins(request.target_signatures, named_id, unknown_id)
+    )
+
+
+def _unknown_target_ids(request: BodyPairPreassignmentRequest) -> Tuple[int, ...]:
+    return tuple(
+        target_id
+        for target_id in request.target_signatures
+        if request.target_variants.get(target_id, "Unknown") == "Unknown"
+    )
+
+
+def _named_part_target_ids(
+    request: BodyPairPreassignmentRequest,
+    pair: BodyVariantPair,
+) -> Tuple[int, ...]:
+    stocky_name = request.source_names.get(pair.stocky_source_id)
+    slim_name = request.source_names.get(pair.slim_source_id)
+    return tuple(
+        target_id
+        for target_id, target_name in request.target_names.items()
+        if _named_target_matches_pair(stocky_name, slim_name, target_name)
+    )
+
+
+def _named_target_matches_pair(
+    stocky_name: Optional[UnitCustomizationName],
+    slim_name: Optional[UnitCustomizationName],
+    target_name: Optional[UnitCustomizationName],
+) -> bool:
+    if target_name is None or target_name.body_variant() not in {"Stocky", "Slim"}:
+        return False
+    return _same_part(stocky_name, target_name) or _same_part(slim_name, target_name)
+
+
+def _dedupe_target_pairs(pairs: Tuple[Tuple[int, int], ...]) -> Tuple[Tuple[int, int], ...]:
+    seen: set[frozenset[int]] = set()
+    unique: List[Tuple[int, int]] = []
+    for pair in pairs:
+        key = frozenset(pair)
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(pair)
+    return tuple(unique)
 
 
 def _body_pair_score(
@@ -219,12 +321,40 @@ def _orient_body_pair_targets(
     pair: BodyVariantPair,
     targets: Tuple[int, int],
 ) -> Optional[Tuple[int, int]]:
+    named_targets = _named_body_pair_orientation(request, targets)
+    if named_targets is not None:
+        return named_targets
     fatter_target_id = _fatter_target_id(request.target_signatures, targets)
     if fatter_target_id is not None:
         return fatter_target_id, _other_target(targets, fatter_target_id)
     stockier_target_id = _stockier_depth_target_id(request.target_signatures, targets)
     if stockier_target_id is not None:
         return stockier_target_id, _other_target(targets, stockier_target_id)
+    return None
+
+
+def _named_body_pair_orientation(
+    request: BodyPairPreassignmentRequest,
+    targets: Tuple[int, int],
+) -> Optional[Tuple[int, int]]:
+    stocky_target_id = _target_id_with_variant(request, targets, "Stocky")
+    if stocky_target_id is not None:
+        return stocky_target_id, _other_target(targets, stocky_target_id)
+    slim_target_id = _target_id_with_variant(request, targets, "Slim")
+    if slim_target_id is not None:
+        return _other_target(targets, slim_target_id), slim_target_id
+    return None
+
+
+def _target_id_with_variant(
+    request: BodyPairPreassignmentRequest,
+    targets: Tuple[int, int],
+    variant: str,
+) -> Optional[int]:
+    for target_id in targets:
+        name = request.target_names.get(target_id)
+        if name is not None and name.body_variant() == variant:
+            return target_id
     return None
 
 
@@ -284,8 +414,8 @@ def _body_variant_pairs(
     )
 
 
-def _pair_key(name: UnitCustomizationName) -> Tuple[str, str, str]:
-    return name.slot, name.weight, name.piece_type
+def _pair_key(name: UnitCustomizationName) -> Tuple[str, str]:
+    return name.slot, name.piece_type
 
 
 def _source_pair_has_stocky_expansion(

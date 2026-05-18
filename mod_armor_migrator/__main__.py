@@ -52,7 +52,7 @@ def main(argv=None) -> int:
                         "--data-dir. Targets are keyed by armor NAME.")
     p.add_argument("--experimental-partial-remap", action="store_true",
                    help="Mode A only: write a diagnostic patch even when automatic "
-                        "semantic remap is incomplete. Unmatched Unit entries are "
+                        "geometry remap is incomplete. Unmatched Unit entries are "
                         "skipped; unsafe non-Unit ordinal remaps are kept with "
                         "warnings. Intended for manual in-game testing.")
 

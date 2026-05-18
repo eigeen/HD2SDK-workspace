@@ -5,10 +5,9 @@ FileIDs and the cross-resource references baked inside Unit / Material blobs.
 
 Mapping strategy
 ----------------
-Armor Unit entries are semantic slots identified by their FileID hashes and
-embedded names/metadata, not by their position in the archive. We therefore
-never derive Unit remaps from archive order. Unit migration needs an explicit
-semantic table such as `--reference-remap-json` or `--remap-json`.
+Armor Unit entries are matched by direct mesh geometry, not by archive order or
+embedded names. Unit migration uses explicit trusted remap JSON when supplied;
+otherwise the tool compares source/target Unit vertex distributions.
 
 For non-Unit resources that are structurally parallel, archive order is still
 used as a best-effort fallback. If the counts differ for a patch-used type,
@@ -27,10 +26,10 @@ from .archive import BundleIndex, StreamToc, list_file_ids
 from .constants import TYPE_NAMES, UnitID, MaterialID, TexID, BoneID
 from . import refs
 from .padding import EmptyUnitTemplate, extract_template, pad_patch
-from .unit_semantics import (
-    UnitSemanticRemap,
-    build_unit_semantic_remap,
-    format_unit_semantic_issues,
+from .unit_geometry import (
+    UnitGeometryRemap,
+    build_unit_geometry_remap,
+    format_unit_geometry_issues,
 )
 
 
@@ -120,7 +119,7 @@ def build_remap(
     """Build a FileID remap from source to target archive entries.
 
     Unit entries are intentionally excluded because their archive order is not
-    a stable slot identity. They must come from a reference/name/hash remap.
+    a stable slot identity. Automatic Unit mapping is done later by geometry.
     """
     src_by_type = source.by_type()
     tgt_by_type = target.by_type()
@@ -156,7 +155,7 @@ def build_remap(
             if len(src_entries) > len(tgt_entries):
                 skipped.append(tid)
                 skipped_file_ids.update(e.file_id for e in src_entries)
-            log.debug("%s skip Unit ordinal remap: Unit slots require semantic remap",
+            log.debug("%s skip Unit ordinal remap: Unit slots require geometry remap",
                       log_prefix)
             continue
         if len(src_entries) > len(tgt_entries):
@@ -228,7 +227,7 @@ def migrate_one(
             log.info("[%s] applied reference remap override: %d FileIDs, %d slot IDs",
                      target_entry.name, len(ref_file_ids), len(ref_slot_ids))
         else:
-            unit_remap = build_unit_semantic_remap(patch, source, target)
+            unit_remap = build_unit_geometry_remap(patch, source, target)
             if experimental_partial_remap:
                 write_file_ids = _patch_dependency_file_ids(
                     patch,
@@ -237,14 +236,16 @@ def migrate_one(
             if not unit_remap.is_complete():
                 if not experimental_partial_remap:
                     raise UnsafePartialRemapError(
-                        _format_unsafe_unit_semantic_message(target_entry, unit_remap)
+                        _format_unsafe_unit_geometry_message(target_entry, unit_remap)
                     )
                 _log_experimental_unit_remap(target_entry, unit_remap)
                 skipped_file_ids.update(_unit_issue_file_ids(unit_remap))
             remap.update(unit_remap.remap)
             _add_unit_header_ref_remaps(remap, unit_remap, source, target, target_entry)
+            if unit_remap.extra_unit_file_ids:
+                extra_unit_file_ids = unit_remap.extra_unit_file_ids
             skipped_file_ids.difference_update(unit_remap.remap.keys())
-            _log_unit_remap_levels(target_entry, unit_remap)
+            _log_unit_geometry_remap(target_entry, unit_remap)
             if write_file_ids is not None:
                 _log_patch_dependency_summary(target_entry, patch, write_file_ids)
             _log_referenced_texture_remaps(patch, source, remap, target_entry, write_file_ids)
@@ -606,32 +607,32 @@ def _format_unsafe_type_counts(unsafe_types: List[int], plan: RemapPlan) -> str:
     return "; ".join(details)
 
 
-def _format_unsafe_unit_semantic_message(
+def _format_unsafe_unit_geometry_message(
     target_entry: ArmorEntry,
-    unit_remap: UnitSemanticRemap,
+    unit_remap: UnitGeometryRemap,
 ) -> str:
-    """Describe why Unit semantic matching could not produce a full remap."""
-    details = format_unit_semantic_issues(unit_remap)
+    """Describe why Unit geometry matching could not produce a full remap."""
+    details = format_unit_geometry_issues(unit_remap)
     return (
-        f"[{target_entry.name}] incomplete Unit semantic remap. "
-        "Unit slots are FileID/name semantics and must not be matched by "
+        f"[{target_entry.name}] incomplete Unit geometry remap. "
+        "Unit slots are matched by mesh geometry and must not be matched by "
         f"archive order. {details}"
     )
 
 
-def _unit_issue_file_ids(unit_remap: UnitSemanticRemap) -> set[int]:
-    """Return all source Unit FileIDs that relaxed semantic matching could not map."""
+def _unit_issue_file_ids(unit_remap: UnitGeometryRemap) -> set[int]:
+    """Return all source Unit FileIDs that relaxed geometry matching could not map."""
     return {issue.source_file_id for issue in unit_remap.missing + unit_remap.ambiguous}
 
 
 def _log_experimental_unit_remap(
     target_entry: ArmorEntry,
-    unit_remap: UnitSemanticRemap,
+    unit_remap: UnitGeometryRemap,
 ) -> None:
     """Warn about skipped Units when experimental partial output is requested."""
-    details = format_unit_semantic_issues(unit_remap, limit=12)
+    details = format_unit_geometry_issues(unit_remap, limit=12)
     log.warning(
-        "[%s] experimental partial Unit remap: %d mapped, %d skipped. %s",
+        "[%s] experimental partial Unit geometry remap: %d mapped, %d skipped. %s",
         target_entry.name,
         len(unit_remap.remap),
         len(_unit_issue_file_ids(unit_remap)),
@@ -641,7 +642,7 @@ def _log_experimental_unit_remap(
 
 def _add_unit_header_ref_remaps(
     remap: Dict[int, int],
-    unit_remap: UnitSemanticRemap,
+    unit_remap: UnitGeometryRemap,
     source: StreamToc,
     target: StreamToc,
     target_entry: ArmorEntry,
@@ -685,26 +686,26 @@ def _unit_header_refs(toc_data: bytes) -> Tuple[int, ...]:
     return struct.unpack_from("<QQQQQ", toc_data, 0)
 
 
-def _log_unit_remap_levels(
+def _log_unit_geometry_remap(
     target_entry: ArmorEntry,
-    unit_remap: UnitSemanticRemap,
+    unit_remap: UnitGeometryRemap,
 ) -> None:
-    """Log how many Unit FileIDs were mapped by each semantic priority level."""
-    level_counts: Dict[str, int] = {}
-    for level in unit_remap.match_levels.values():
-        level_counts[level] = level_counts.get(level, 0) + 1
-    if level_counts:
-        counts = ", ".join(
-            f"{level}={level_counts[level]}" for level in sorted(level_counts)
-        )
+    """Log geometry Unit remap scores and top candidates."""
+    log.info("[%s] applied geometry Unit remap: %d FileIDs",
+             target_entry.name, len(unit_remap.remap))
+    for source_id, target_id in sorted(unit_remap.remap.items()):
+        score = unit_remap.scores.get(source_id, 0.0)
+        margin = unit_remap.margins.get(source_id, 0.0)
+        ranking = unit_remap.rankings.get(source_id, ())
         log.info(
-            "[%s] applied semantic Unit remap: %d FileIDs (%s)",
+            "[%s]   Unit %d -> %d score=%.4f margin=%.4f candidates=%s",
             target_entry.name,
-            len(unit_remap.remap),
-            counts,
+            source_id,
+            target_id,
+            score,
+            margin,
+            list(ranking),
         )
-        return
-    log.info("[%s] applied semantic Unit remap: 0 FileIDs", target_entry.name)
 
 
 def _log_referenced_texture_remaps(

@@ -13,7 +13,7 @@ import tempfile
 from .archive import StreamToc, TocEntry
 from .constants import UnitID, MaterialID, BoneID, TexID
 from .migrator import RemapPlan, _find_unsafe_partial_types
-from .unit_semantics import UnitSemanticKey, build_unit_semantic_remap
+from .unit_geometry import GeometryMatchSettings, build_unit_geometry_remap
 from . import refs
 
 
@@ -46,14 +46,55 @@ def _make_material_blob(num_textures: int, tex_ids: list) -> bytes:
     return bytes(buf)
 
 
-def _make_semantic_unit_blob(key: UnitSemanticKey) -> bytes:
-    parts = (
-        f"HelldiverCustomizationBodyType_{key.body_type}",
-        f"HelldiverCustomizationSlot_{key.slot}",
-        f"HelldiverCustomizationWeight_{key.weight}",
-        f"HelldiverCustomizationPieceType_{key.piece_type}",
-    )
-    return b"\x00".join(part.encode("utf-8") for part in parts)
+def _make_geometry_entry(file_id: int, points: list, marker: bytes = b"") -> TocEntry:
+    toc_data, gpu_data = _make_geometry_unit_blob(points, marker)
+    return TocEntry(file_id=file_id, type_id=UnitID, toc_data=toc_data, gpu_data=gpu_data)
+
+
+def _make_geometry_unit_blob(points: list, marker: bytes = b"") -> tuple:
+    stream_off = 0x80
+    stream_base = 0x90
+    mesh_off = 0x260
+    mesh_base = 0x26C
+    section_rel = 132
+    toc_size = mesh_base + section_rel + 24 + len(marker)
+    toc = bytearray(toc_size)
+    struct.pack_into("<I", toc, 0x2C, 10800438)
+    struct.pack_into("<I", toc, 0x5C, stream_off)
+    struct.pack_into("<I", toc, 0x64, mesh_off)
+    _write_stream_info(toc, stream_off, stream_base, len(points))
+    _write_mesh_info(toc, mesh_off, mesh_base, section_rel, len(points))
+    if marker:
+        toc[-len(marker):] = marker
+    gpu = b"".join(struct.pack("<3f", *point) for point in points)
+    return bytes(toc), gpu
+
+
+def _write_stream_info(toc: bytearray, stream_off: int, stream_base: int, vertex_count: int) -> None:
+    struct.pack_into("<I", toc, stream_off, 1)
+    struct.pack_into("<I", toc, stream_off + 4, stream_base - stream_off)
+    struct.pack_into("<IIIQ", toc, stream_base + 8, 0, 2, 0, 0)
+    struct.pack_into("<Q", toc, stream_base + 328, 1)
+    struct.pack_into("<II", toc, stream_base + 352, vertex_count, 12)
+    struct.pack_into("<II", toc, stream_base + 392, 0, 0)
+    struct.pack_into("<IIII", toc, stream_base + 416, 0, vertex_count * 12, 0, 0)
+
+
+def _write_mesh_info(
+    toc: bytearray,
+    mesh_off: int,
+    mesh_base: int,
+    section_rel: int,
+    vertex_count: int,
+) -> None:
+    struct.pack_into("<I", toc, mesh_off, 1)
+    struct.pack_into("<I", toc, mesh_off + 4, mesh_base - mesh_off)
+    struct.pack_into("<i", toc, mesh_base + 56, 0)
+    struct.pack_into("<I", toc, mesh_base + 104, 1)
+    struct.pack_into("<I", toc, mesh_base + 108, 128)
+    struct.pack_into("<II", toc, mesh_base + 120, 1, section_rel)
+    section_at = mesh_base + section_rel
+    struct.pack_into("<IIIIII", toc, section_at, 0, 0, vertex_count, 0, 0, 0)
 
 
 def test_refs_roundtrip():
@@ -132,18 +173,16 @@ def test_unsafe_non_unit_partial_remap_detection():
     print("  unsafe non-Unit partial remap detection OK")
 
 
-def test_unit_semantic_remap_ignores_order():
-    hip = UnitSemanticKey("Slim", "Hip", "Medium", "Undergarment")
-    arm = UnitSemanticKey("Stocky", "RightArm", "Medium", "Undergarment")
+def test_unit_geometry_remap_ignores_names_and_order():
     source = StreamToc()
     source.entries = [
-        TocEntry(file_id=0x01, type_id=UnitID, toc_data=_make_semantic_unit_blob(hip)),
-        TocEntry(file_id=0x02, type_id=UnitID, toc_data=_make_semantic_unit_blob(arm)),
+        _make_geometry_entry(0x01, _box_points(0, 0, 0, 1, 1, 1), b"wrong_name_arm"),
+        _make_geometry_entry(0x02, _line_points(0, 0, 0, 8, 0, 0), b"wrong_name_hip"),
     ]
     target = StreamToc()
     target.entries = [
-        TocEntry(file_id=0x22, type_id=UnitID, toc_data=_make_semantic_unit_blob(arm)),
-        TocEntry(file_id=0x11, type_id=UnitID, toc_data=_make_semantic_unit_blob(hip)),
+        _make_geometry_entry(0x22, _line_points(0, 0, 0, 8, 0, 0)),
+        _make_geometry_entry(0x11, _box_points(0, 0, 0, 1, 1, 1)),
     ]
     patch = StreamToc()
     patch.entries = [
@@ -151,10 +190,109 @@ def test_unit_semantic_remap_ignores_order():
         TocEntry(file_id=0x02, type_id=UnitID, toc_data=b""),
     ]
 
-    result = build_unit_semantic_remap(patch, source, target)
+    result = build_unit_geometry_remap(patch, source, target)
     assert result.is_complete(), result
     assert result.remap == {0x01: 0x11, 0x02: 0x22}, result.remap
-    print("  Unit semantic remap ignores order OK")
+    print("  Unit geometry remap ignores names/order OK")
+
+
+def test_unit_geometry_prefers_distribution_over_centroid():
+    source = StreamToc()
+    source.entries = [_make_geometry_entry(0x01, _line_points(0, 0, 0, 10, 0, 0))]
+    target = StreamToc()
+    target.entries = [
+        _make_geometry_entry(0x11, _cluster_points(5, 0, 0)),
+        _make_geometry_entry(0x22, _line_points(0, 0, 0, 10, 0, 0)),
+    ]
+    patch = StreamToc()
+    patch.entries = [TocEntry(file_id=0x01, type_id=UnitID, toc_data=b"")]
+
+    result = build_unit_geometry_remap(patch, source, target)
+    assert result.is_complete(), result
+    assert result.remap == {0x01: 0x22}, result.remap
+    print("  Unit geometry remap uses distribution OK")
+
+
+def test_unit_geometry_blocks_ambiguous_candidates():
+    source = StreamToc()
+    source.entries = [_make_geometry_entry(0x01, _box_points(0, 0, 0, 1, 1, 1))]
+    target = StreamToc()
+    target.entries = [
+        _make_geometry_entry(0x11, _box_points(0, 0, 0, 1, 1, 1)),
+        _make_geometry_entry(0x22, _box_points(0, 0, 0, 1, 1, 1)),
+    ]
+    patch = StreamToc()
+    patch.entries = [TocEntry(file_id=0x01, type_id=UnitID, toc_data=b"")]
+
+    result = build_unit_geometry_remap(
+        patch,
+        source,
+        target,
+        GeometryMatchSettings(min_margin=0.015),
+    )
+    assert not result.is_complete(), result
+    assert result.ambiguous and result.ambiguous[0].source_file_id == 0x01
+    print("  Unit geometry ambiguous match blocking OK")
+
+
+def test_unit_geometry_reports_missing_and_extra_units():
+    source = StreamToc()
+    source.entries = [
+        _make_geometry_entry(0x01, _box_points(0, 0, 0, 1, 1, 1)),
+        TocEntry(file_id=0x02, type_id=UnitID, toc_data=b"not-a-unit"),
+    ]
+    target = StreamToc()
+    target.entries = [
+        _make_geometry_entry(0x11, _box_points(0, 0, 0, 1, 1, 1)),
+        _make_geometry_entry(0x33, _box_points(20, 0, 0, 1, 1, 1)),
+    ]
+    patch = StreamToc()
+    patch.entries = [
+        TocEntry(file_id=0x01, type_id=UnitID, toc_data=b""),
+        TocEntry(file_id=0x02, type_id=UnitID, toc_data=b""),
+    ]
+
+    result = build_unit_geometry_remap(patch, source, target)
+    assert not result.is_complete(), result
+    assert result.remap == {0x01: 0x11}, result.remap
+    assert {issue.source_file_id for issue in result.missing} == {0x02}
+    assert result.extra_unit_file_ids == [0x33], result.extra_unit_file_ids
+    print("  Unit geometry missing/extra diagnostics OK")
+
+
+def _box_points(x: float, y: float, z: float, sx: float, sy: float, sz: float) -> list:
+    return [
+        (x, y, z),
+        (x + sx, y, z),
+        (x, y + sy, z),
+        (x, y, z + sz),
+        (x + sx, y + sy, z),
+        (x + sx, y, z + sz),
+        (x, y + sy, z + sz),
+        (x + sx, y + sy, z + sz),
+    ]
+
+
+def _line_points(x1: float, y1: float, z1: float, x2: float, y2: float, z2: float) -> list:
+    return [
+        (
+            x1 + (x2 - x1) * index / 10,
+            y1 + (y2 - y1) * index / 10,
+            z1 + (z2 - z1) * index / 10,
+        )
+        for index in range(11)
+    ]
+
+
+def _cluster_points(x: float, y: float, z: float) -> list:
+    return [
+        (x - 0.1, y, z),
+        (x + 0.1, y, z),
+        (x, y - 0.1, z),
+        (x, y + 0.1, z),
+        (x, y, z - 0.1),
+        (x, y, z + 0.1),
+    ]
 
 
 if __name__ == "__main__":
@@ -162,5 +300,8 @@ if __name__ == "__main__":
     test_refs_roundtrip()
     test_streamtoc_roundtrip()
     test_unsafe_non_unit_partial_remap_detection()
-    test_unit_semantic_remap_ignores_order()
+    test_unit_geometry_remap_ignores_names_and_order()
+    test_unit_geometry_prefers_distribution_over_centroid()
+    test_unit_geometry_blocks_ambiguous_candidates()
+    test_unit_geometry_reports_missing_and_extra_units()
     print("ALL PASS")

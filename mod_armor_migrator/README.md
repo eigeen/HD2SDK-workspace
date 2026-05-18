@@ -21,11 +21,10 @@ non-Slim install you don't need LZ4 at all — armor archives are uncompressed.
 ## How it works
 
 Each armor archive in `data/<hash>` stores Unit, Material, and Texture
-resources. Unit entries are semantic armor slots: their FileIDs are hashes, and
-their meaning comes from the resource name / customization metadata. Unit
-entries must not be matched by archive order. Unit migration therefore requires
-an explicit semantic remap, usually from `--reference-remap-json` or
-`--remap-json`.
+resources. Unit entries are mesh-backed armor slots: their FileIDs are hashes,
+and archive order is not a stable identity. Unit migration therefore uses an
+explicit trusted remap from `--reference-remap-json` / `--remap-json` when
+provided; otherwise it compares parsed Unit vertex distributions directly.
 
 For non-Unit resources that are structurally parallel, the tool can still use
 archive order as a fallback:
@@ -39,7 +38,7 @@ source.textures[i]   →  target.textures[i]
 
 For each entry in the mod patch:
 1. Its top-level `TocEntry.FileID` is rewritten to the target's matching
-   FileID from the semantic remap (Unit) or safe fallback remap (non-Unit).
+   FileID from the geometry remap (Unit) or safe fallback remap (non-Unit).
 2. References baked inside the entry's `TocData` are rewritten too:
    - **Unit**: `UnkRef1`, `BonesRef`, `CompositeRef`, `UnkRef2`,
      `StateMachineRef`, plus `MaterialIDs[]` in the materials slot.
@@ -48,9 +47,9 @@ For each entry in the mod patch:
 The raw GPU/Stream payloads (vertex buffers, DDS pixel data) are copied
 through untouched — that *is* the mod's content.
 
-If source and target have differing counts for a given TypeID, that type is
-skipped for that target (with a warning); the resulting patch will still load
-but won't replace the mismatching files.
+If source and target have differing counts for a non-Unit TypeID, that type is
+skipped for that target (with a warning); Unit count differences are handled by
+geometry matching plus empty-mesh padding for target-only parts.
 
 ## Usage
 
@@ -248,6 +247,7 @@ and TypeID layout for all three.
 |---|---|
 | `archive.py` | LEGACY package read/write + DSAR decompress |
 | `refs.py`    | Rewrite Unit/Material header references |
+| `unit_geometry.py` | Parse Unit vertex positions and match armor slots by geometry |
 | `migrator.py`| Source autodetect + per-target migration |
 | `__main__.py`| CLI |
 | `constants.py` | Type IDs and magic numbers |

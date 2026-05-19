@@ -14,6 +14,7 @@ from .archive import StreamToc, TocEntry
 from .constants import UnitID, MaterialID, BoneID, TexID
 from .migrator import ArmorEntry, migrate_one
 from .unit_geometry import GeometryMatchSettings, build_unit_geometry_remap
+from .unit_names import extract_unit_customization_name
 from . import refs
 
 
@@ -424,6 +425,16 @@ def test_unit_geometry_preassigns_identical_body_pair():
     print("  Unit geometry identical body pair preassignment OK")
 
 
+def test_unit_names_infers_body_variant_from_bonehash():
+    male_name = extract_unit_customization_name(struct.pack("<I", 531958952))
+    female_name = extract_unit_customization_name(struct.pack("<I", 1146309845))
+    assert male_name is not None
+    assert female_name is not None
+    assert male_name.label() == "Stocky/Torso/Medium/Undergarment"
+    assert female_name.label() == "Slim/Torso/Medium/Undergarment"
+    print("  Unit names infer body variant from bonehash OK")
+
+
 def _custom_marker(
     body_type: str,
     slot: str = "RightLeg",
@@ -489,4 +500,5 @@ if __name__ == "__main__":
     test_unit_geometry_trusts_unique_structured_target()
     test_unit_geometry_ignores_weight_and_piece_type_for_slot_scope()
     test_unit_geometry_preassigns_identical_body_pair()
+    test_unit_names_infers_body_variant_from_bonehash()
     print("ALL PASS")

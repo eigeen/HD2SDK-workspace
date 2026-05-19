@@ -71,8 +71,9 @@ def main(argv=None) -> int:
                         "rewriting. Without this flag, the template is sanitized "
                         "to remove material refs / draw indices, then slot IDs are "
                         "remapped to the target armor's naming.")
-    p.add_argument("--patch-suffix", default="patch_0",
-                   help="Suffix to use for each output patch file (default: patch_0).")
+    p.add_argument("--patch-suffix", default="9ba626afa44a3aa3.patch_0",
+                   help="Filename to use for each output patch file "
+                        "(default: 9ba626afa44a3aa3.patch_0).")
     p.add_argument("-v", "--verbose", action="count", default=0,
                    help="-v info, -vv debug.")
     args = p.parse_args(argv)

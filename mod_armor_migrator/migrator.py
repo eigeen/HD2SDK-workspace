@@ -187,7 +187,7 @@ def migrate_one(
     target: Optional[StreamToc],
     target_entry: ArmorEntry,
     out_root: str,
-    patch_suffix: str = "patch_0",
+    patch_suffix: str = "9ba626afa44a3aa3.patch_0",
     precomputed: Optional[dict] = None,
     reference_remap: Optional[dict] = None,
     empty_unit_template: Optional[EmptyUnitTemplate] = None,
@@ -315,9 +315,9 @@ def migrate_one(
                     target_entry.name, len(extra_unit_file_ids))
 
     safe_name = _safe_filename(target_entry.name)
-    out_dir = os.path.join(out_root, f"{target_entry.hash_hex}_{safe_name}")
+    out_dir = os.path.join(out_root, safe_name)
     os.makedirs(out_dir, exist_ok=True)
-    out_path = os.path.join(out_dir, f"{target_entry.hash_hex}.{patch_suffix}")
+    out_path = os.path.join(out_dir, patch_suffix)
     new_patch.write(out_path)
 
     return MigrationReport(
@@ -340,7 +340,7 @@ def migrate_all(
     source_hash: Optional[str] = None,
     target_hashes: Optional[List[str]] = None,
     category: str = "Armor",
-    patch_suffix: str = "patch_0",
+    patch_suffix: str = "9ba626afa44a3aa3.patch_0",
     empty_unit_template: Optional[EmptyUnitTemplate] = None,
     empty_mesh_verbatim: bool = False,
     reference_remap_json: Optional[str] = None,
@@ -438,7 +438,7 @@ def migrate_from_remap_json(
     remap_json_path: str,
     out_dir: str,
     target_names: Optional[List[str]] = None,
-    patch_suffix: str = "patch_0",
+    patch_suffix: str = "9ba626afa44a3aa3.patch_0",
     empty_unit_template: Optional[EmptyUnitTemplate] = None,
     empty_mesh_verbatim: bool = False,
 ) -> List[MigrationReport]:

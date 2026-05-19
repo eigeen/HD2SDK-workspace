@@ -1,0 +1,38 @@
+[package]
+name = "mod_armor_migrator"
+version = "0.1.0"
+edition = "2021"
+description = "Migrate Helldivers 2 armor mod patches across all armor archives"
+license = "MIT OR Apache-2.0"
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "mod_armor_migrator"
+path = "src/main.rs"
+
+[dependencies]
+clap = { version = "4.5", features = ["derive"] }
+color-eyre = "0.6"
+eyre = "0.6"
+thiserror = "2"
+rayon = "1.10"
+byteorder = "1.5"
+lz4_flex = { version = "0.11", default-features = false, features = ["std", "safe-decode"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+walkdir = "2.5"
+indicatif = { version = "0.17", features = ["rayon"] }
+dialoguer = { version = "0.11", features = ["fuzzy-select"] }
+owo-colors = { version = "4", features = ["supports-colors"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing-indicatif = "0.3"
+
+[dev-dependencies]
+tempfile = "3"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1

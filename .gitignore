@@ -4,3 +4,4 @@ __pycache__
 deps/*
 !deps/texconv.exe
 .python_version
+.DS_Store
